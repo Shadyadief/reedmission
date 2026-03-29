@@ -1,32 +1,34 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
 *.egg-info/
 dist/
 build/
-.eggs/
 
-# Virtual environments
-.venv/
-venv/
-env/
+# Data files (do not commit large datasets)
+*.csv
+*.xlsx
+*.json
+data/
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
 
-# Data (large files)
-data/*.csv
-data/*.xlsx
-data/*.parquet
+# Streamlit
+.streamlit/secrets.toml
 
-# Trained models (large binary files)
-models/*.pkl
-models/*.joblib
-
-# Secrets & credentials
-.env
-secrets.toml
+# Models (large binary files)
+*.pkl
+*.joblib
+*.h5
+*.model
 
 # OS
 .DS_Store
@@ -35,6 +37,3 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
-
-# Streamlit
-.streamlit/secrets.toml

@@ -1,509 +1,618 @@
-"""
-app.py — Hospital Readmission Prediction  |  Streamlit Web App
-Run: streamlit run app.py
-"""
-
-import os
-import sys
-import warnings
-
-import joblib
-import numpy as np
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
 import streamlit as st
-from sklearn.metrics import (
-    confusion_matrix,
-    roc_curve,
-    auc,
-    classification_report,
-    accuracy_score,
-    f1_score,
-    roc_auc_score,
-)
-
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
 warnings.filterwarnings('ignore')
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-from preprocessing import preprocess
 
-# ── Page config ───────────────────────────────────────────────────────────────
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    accuracy_score, classification_report,
+    confusion_matrix, roc_auc_score,
+    roc_curve, f1_score
+)
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+import xgboost as xgb
 
 st.set_page_config(
-    page_title="Hospital Readmission Predictor",
+    page_title="🏥 Hospital Readmission Prediction",
     page_icon="🏥",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-
+# ─── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
+    .main-header {
+        font-size: 2.2rem;
+        font-weight: 800;
+        color: #2196F3;
+        text-align: center;
+        padding: 1rem 0;
+    }
     .metric-card {
-        background: #f0f4ff;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 1rem;
         border-radius: 12px;
-        padding: 1rem 1.2rem;
-        margin-bottom: 0.5rem;
+        color: white;
+        text-align: center;
+        margin: 0.3rem;
+    }
+    .section-title {
+        font-size: 1.4rem;
+        font-weight: 700;
+        color: #1a1a2e;
         border-left: 4px solid #2196F3;
+        padding-left: 0.7rem;
+        margin: 1.5rem 0 1rem 0;
     }
-    .metric-label { font-size: 13px; color: #666; margin: 0; }
-    .metric-value { font-size: 26px; font-weight: 600; color: #1a1a1a; margin: 0; }
-    .risk-high   { background: #fff0f0; border-left-color: #F44336; }
-    .risk-low    { background: #f0fff4; border-left-color: #4CAF50; }
-    .section-header {
-        font-size: 18px; font-weight: 600; color: #1a1a1a;
-        margin: 1.5rem 0 0.5rem; padding-bottom: 4px;
-        border-bottom: 2px solid #e0e0e0;
-    }
+    .stAlert { border-radius: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ─── Helper Functions ───────────────────────────────────────────────────────────
+@st.cache_data
+def load_and_preprocess(df_raw):
+    df = df_raw.copy()
 
-st.sidebar.image("https://img.icons8.com/color/96/hospital.png", width=60)
-st.sidebar.title("🏥 Readmission Predictor")
-st.sidebar.markdown("---")
+    # Replace placeholders
+    df = df.replace(['?', 'Unknown/Invalid'], np.nan)
 
-page = st.sidebar.radio(
-    "Navigation",
-    ["🏠 Overview", "📊 EDA & Insights", "🔮 Predict", "📈 Model Comparison"],
+    # Drop irrelevant/sparse columns
+    cols_to_drop = [
+        'encounter_id', 'patient_nbr',
+        'examide', 'citoglipton',
+        'max_glu_serum', 'A1Cresult',
+        'payer_code', 'medical_specialty',
+        'weight',
+        'acetohexamide', 'tolbutamide',
+        'troglitazone', 'tolazamide',
+        'glimepiride-pioglitazone',
+        'metformin-rosiglitazone',
+        'metformin-pioglitazone',
+        'glipizide-metformin', 'glyburide-metformin'
+    ]
+    cols_to_drop = [c for c in cols_to_drop if c in df.columns]
+    df.drop(columns=cols_to_drop, inplace=True)
+
+    # Fill missing
+    for col in ['diag_1', 'diag_2', 'diag_3']:
+        if col in df.columns:
+            df[col] = df[col].fillna('Other')
+    if 'race' in df.columns:
+        df['race'] = df['race'].fillna('Other')
+    if 'gender' in df.columns:
+        df['gender'] = df['gender'].fillna(df['gender'].mode()[0])
+
+    # Outlier capping (IQR)
+    num_cols = ['time_in_hospital', 'num_lab_procedures', 'num_procedures',
+                'num_medications', 'number_outpatient', 'number_emergency',
+                'number_inpatient', 'number_diagnoses']
+    for col in num_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            Q1, Q3 = df[col].quantile(0.25), df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            df[col] = df[col].clip(Q1 - 1.5 * IQR, Q3 + 1.5 * IQR)
+
+    # Encode
+    if 'race' in df.columns:
+        df['race'] = df['race'].map({'Caucasian': 1, 'AfricanAmerican': 2,
+                                     'Other': 3, 'Asian': 4, 'Hispanic': 5}).fillna(3)
+    if 'gender' in df.columns:
+        df['gender'] = df['gender'].map({'Male': 1, 'Female': 2}).fillna(1)
+
+    age_order = ['[0-10)', '[10-20)', '[20-30)', '[30-40)', '[40-50)',
+                 '[50-60)', '[60-70)', '[70-80)', '[80-90)', '[90-100)']
+    if 'age' in df.columns:
+        df['age'] = df['age'].map({v: i for i, v in enumerate(age_order)}).fillna(5)
+
+    med_map = {'Down': -1, 'No': 0, 'Steady': 1, 'Up': 2}
+    med_cols = ['metformin', 'repaglinide', 'nateglinide', 'chlorpropamide',
+                'glimepiride', 'glipizide', 'glyburide', 'pioglitazone',
+                'rosiglitazone', 'acarbose', 'miglitol', 'insulin']
+    for col in med_cols:
+        if col in df.columns:
+            df[col] = df[col].map(med_map).fillna(0)
+
+    if 'change' in df.columns:
+        df['change'] = df['change'].map({'No': 0, 'Ch': 1}).fillna(0)
+    if 'diabetesMed' in df.columns:
+        df['diabetesMed'] = df['diabetesMed'].map({'No': 0, 'Yes': 1}).fillna(0)
+
+    # Target
+    if 'readmitted' in df.columns:
+        df['readmitted'] = df['readmitted'].apply(lambda x: 1 if x == '<30' else 0)
+
+    # Diagnosis grouping + OHE
+    def map_diag(code):
+        try:
+            code = float(code)
+        except:
+            return 'Other'
+        if code == 250:      return 'Diabetes'
+        elif 390 <= code < 460: return 'Circulatory'
+        elif 460 <= code < 520: return 'Respiratory'
+        elif 520 <= code < 580: return 'Digestive'
+        elif 580 <= code < 630: return 'Genitourinary'
+        elif 800 <= code < 1000: return 'Injury'
+        else:                   return 'Other'
+
+    for col in ['diag_1', 'diag_2', 'diag_3']:
+        if col in df.columns:
+            df[col] = df[col].apply(map_diag)
+    df = pd.get_dummies(df, columns=[c for c in ['diag_1', 'diag_2', 'diag_3'] if c in df.columns])
+
+    # Feature: total meds taken
+    existing_meds = [c for c in med_cols if c in df.columns]
+    df['num_medications_taken'] = df[existing_meds].clip(lower=0).sum(axis=1)
+
+    return df
+
+
+def train_models(X_train, y_train, X_test, y_test):
+    results = {}
+
+    # XGBoost
+    scale_pos_weight = (y_train == 0).sum() / (y_train == 1).sum()
+    xgb_model = xgb.XGBClassifier(
+        colsample_bytree=0.7, learning_rate=0.1, max_depth=6,
+        n_estimators=300, scale_pos_weight=scale_pos_weight,
+        subsample=0.8, random_state=42,
+        eval_metric='logloss', use_label_encoder=False
+    )
+    xgb_model.fit(X_train, y_train)
+    y_pred = xgb_model.predict(X_test)
+    y_prob = xgb_model.predict_proba(X_test)[:, 1]
+    results['XGBoost'] = {
+        'model': xgb_model, 'y_pred': y_pred, 'y_prob': y_prob,
+        'acc': accuracy_score(y_test, y_pred),
+        'f1': f1_score(y_test, y_pred),
+        'roc': roc_auc_score(y_test, y_prob),
+        'report': classification_report(y_test, y_pred, output_dict=True)
+    }
+
+    # Random Forest
+    rf_model = RandomForestClassifier(
+        n_estimators=200, max_depth=10, class_weight='balanced',
+        random_state=42, n_jobs=-1
+    )
+    rf_model.fit(X_train, y_train)
+    y_pred = rf_model.predict(X_test)
+    y_prob = rf_model.predict_proba(X_test)[:, 1]
+    results['RandomForest'] = {
+        'model': rf_model, 'y_pred': y_pred, 'y_prob': y_prob,
+        'acc': accuracy_score(y_test, y_pred),
+        'f1': f1_score(y_test, y_pred),
+        'roc': roc_auc_score(y_test, y_prob),
+        'report': classification_report(y_test, y_pred, output_dict=True)
+    }
+
+    # Logistic Regression
+    lr_model = LogisticRegression(class_weight='balanced', max_iter=1000,
+                                  random_state=42, solver='lbfgs')
+    lr_model.fit(X_train, y_train)
+    y_pred = lr_model.predict(X_test)
+    y_prob = lr_model.predict_proba(X_test)[:, 1]
+    results['LogisticRegression'] = {
+        'model': lr_model, 'y_pred': y_pred, 'y_prob': y_prob,
+        'acc': accuracy_score(y_test, y_pred),
+        'f1': f1_score(y_test, y_pred),
+        'roc': roc_auc_score(y_test, y_prob),
+        'report': classification_report(y_test, y_pred, output_dict=True)
+    }
+
+    return results
+
+
+# ─── Sidebar ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.image("https://img.icons8.com/color/96/hospital-2.png", width=80)
+    st.title("🏥 Control Panel")
+    st.markdown("---")
+
+    page = st.radio("📋 Navigation", [
+        "🏠 Overview",
+        "📊 EDA",
+        "🤖 Train & Evaluate",
+        "🔮 Predict"
+    ])
+
+    st.markdown("---")
+    st.markdown("**Dataset:** Diabetic Patients")
+    st.markdown("**Target:** Early Readmission (<30 days)")
+    st.markdown("**Records:** 101,766")
+
+# ─── Load Data ──────────────────────────────────────────────────────────────────
+st.markdown('<div class="main-header">🏥 Hospital Readmission Prediction Pipeline</div>',
+            unsafe_allow_html=True)
+
+uploaded_file = st.file_uploader(
+    "📂 Upload diabetic_data.csv",
+    type=["csv"],
+    help="Upload the diabetic patients dataset (CSV format)"
 )
 
-MODEL_FILES = {
-    "XGBoost": "models/xgboost.pkl",
-    "XGBoost + SMOTE": "models/xgboost_smote.pkl",
-    "Random Forest": "models/random_forest.pkl",
-    "Logistic Regression": "models/logistic_regression.pkl",
-    "Voting Ensemble": "models/voting_ensemble.pkl",
-    "Stacking Ensemble": "models/stacking_ensemble.pkl",
-}
+if uploaded_file is None:
+    st.info("👆 Please upload **diabetic_data.csv** to get started. "
+            "You can download the dataset from the UCI ML Repository "
+            "(Diabetes 130-US hospitals dataset).")
+    st.stop()
 
-HARDCODED_METRICS = pd.DataFrame({
-    'Model': ['XGBoost', 'XGBoost+SMOTE', 'RandomForest',
-              'LogisticRegression', 'VotingEnsemble', 'StackingEnsemble'],
-    'Accuracy':           [0.6941, 0.8884, 0.6823, 0.6555, 0.8733, 0.8862],
-    'F1 Score':           [0.2772, 0.0173, 0.2748, 0.2583, 0.1384, 0.0524],
-    'ROC AUC':            [0.6637, 0.6757, 0.6639, 0.6436, 0.6619, 0.6676],
-    'Recall (class 1)':   [0.5258, 0.0088, 0.5394, 0.5376, 0.0911, 0.0282],
-    'Precision (class 1)':[0.1882, 0.4878, 0.1843, 0.1700, 0.2871, 0.3699],
-}).set_index('Model')
+df_raw = pd.read_csv(uploaded_file)
+st.success(f"✅ Data loaded: **{df_raw.shape[0]:,}** rows × **{df_raw.shape[1]}** columns")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-@st.cache_resource
-def load_model(path):
-    if os.path.exists(path):
-        return joblib.load(path)
-    return None
-
-
-@st.cache_resource
-def load_scaler():
-    if os.path.exists('models/scaler.pkl'):
-        return joblib.load('models/scaler.pkl')
-    return None
-
-
-@st.cache_resource
-def load_feature_cols():
-    if os.path.exists('models/feature_cols.pkl'):
-        return joblib.load('models/feature_cols.pkl')
-    return None
-
-
-def models_available():
-    return any(os.path.exists(p) for p in MODEL_FILES.values())
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PAGE: Overview
-# ═══════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 1: OVERVIEW
+# ══════════════════════════════════════════════════════════════════════════════
 if page == "🏠 Overview":
-    st.title("🏥 Hospital Readmission Prediction Pipeline")
-    st.markdown(
-        "Predict **early hospital readmission within 30 days** for diabetic patients "
-        "using an ensemble ML pipeline trained on 101,766 records."
-    )
+    st.markdown('<div class="section-title">📋 Dataset Overview</div>', unsafe_allow_html=True)
 
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.markdown("""<div class="metric-card">
-            <p class="metric-label">Dataset Records</p>
-            <p class="metric-value">101,766</p></div>""", unsafe_allow_html=True)
-    with col2:
-        st.markdown("""<div class="metric-card">
-            <p class="metric-label">Features</p>
-            <p class="metric-value">50 → 51</p></div>""", unsafe_allow_html=True)
-    with col3:
-        st.markdown("""<div class="metric-card">
-            <p class="metric-label">Best ROC AUC</p>
-            <p class="metric-value">0.676</p></div>""", unsafe_allow_html=True)
-    with col4:
-        st.markdown("""<div class="metric-card">
-            <p class="metric-label">Positive Class</p>
-            <p class="metric-value">11.2%</p></div>""", unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Records", f"{df_raw.shape[0]:,}")
+    c2.metric("Features", df_raw.shape[1])
+    c3.metric("Early Readmissions",
+              f"{(df_raw['readmitted'] == '<30').sum():,}")
+    c4.metric("Readmission Rate",
+              f"{(df_raw['readmitted'] == '<30').mean()*100:.1f}%")
 
-    st.markdown("---")
+    st.markdown('<div class="section-title">🔍 Raw Data Sample</div>', unsafe_allow_html=True)
+    st.dataframe(df_raw.head(10), use_container_width=True)
 
-    col_left, col_right = st.columns(2)
-    with col_left:
-        st.markdown('<p class="section-header">Pipeline Steps</p>', unsafe_allow_html=True)
-        steps = [
-            ("1. Data Loading", "101,766 records × 50 columns from UCI repository"),
-            ("2. EDA", "Missing values matrix, target distribution, demographics"),
-            ("3. Preprocessing", "Replace placeholders, drop sparse columns, fill NaNs"),
-            ("4. Feature Engineering", "IQR capping, encoding, diagnosis grouping + OHE"),
-            ("5. SMOTE Balancing", "9,086 → 72,326 minority class samples"),
-            ("6. Model Training", "6 models: XGBoost, RF, LR, Voting, Stacking"),
-            ("7. Evaluation", "Accuracy, F1, ROC AUC, Confusion Matrices, PR Curves"),
-        ]
-        for title, desc in steps:
-            st.markdown(f"**{title}** — {desc}")
+    st.markdown('<div class="section-title">📊 Column Info</div>', unsafe_allow_html=True)
+    info_df = pd.DataFrame({
+        'Column': df_raw.columns,
+        'Type': df_raw.dtypes.values,
+        'Non-Null': df_raw.notnull().sum().values,
+        'Null %': (df_raw.isnull().mean() * 100).round(2).values
+    })
+    st.dataframe(info_df, use_container_width=True)
 
-    with col_right:
-        st.markdown('<p class="section-header">Top Features (XGBoost + SMOTE)</p>', unsafe_allow_html=True)
-        feat_data = {
-            'Feature': ['number_inpatient', 'age', 'discharge_disposition_id',
-                        'time_in_hospital', 'race', 'num_procedures', 'gender'],
-            'Importance': [0.2332, 0.0962, 0.0892, 0.0748, 0.0736, 0.0633, 0.0615],
-        }
-        feat_df = pd.DataFrame(feat_data)
-        fig = px.bar(feat_df, x='Importance', y='Feature', orientation='h',
-                     color='Importance', color_continuous_scale='Teal',
-                     title='Top 7 Feature Importances')
-        fig.update_layout(height=340, showlegend=False, coloraxis_showscale=False)
-        st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("---")
-    st.info(
-        "⚠️ **Clinical note:** In healthcare, **recall for the early-readmit class** "
-        "is the most critical metric — missing a high-risk patient costs more than a false alarm. "
-        "XGBoost (scale_pos_weight) achieves the best recall: **0.526**."
-    )
+    st.markdown('<div class="section-title">📈 Statistical Summary</div>', unsafe_allow_html=True)
+    st.dataframe(df_raw.describe().round(2), use_container_width=True)
 
 
-# ═══════════════════════════════════════════════════════════════
-#  PAGE: EDA & Insights
-# ═══════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2: EDA
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "📊 EDA":
+    st.markdown('<div class="section-title">🔍 Exploratory Data Analysis</div>',
+                unsafe_allow_html=True)
 
-elif page == "📊 EDA & Insights":
-    st.title("📊 EDA & Insights")
-
-    tab1, tab2, tab3 = st.tabs(["Target Distribution", "Demographics", "Medication Usage"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🎯 Target", "👥 Demographics", "💊 Medications",
+        "📉 Distributions", "❓ Missing Values"
+    ])
 
     with tab1:
-        col1, col2 = st.columns(2)
-        with col1:
-            raw_data = {'NO': 54864, '>30': 35545, '<30': 11357}
-            fig = px.bar(
-                x=list(raw_data.keys()), y=list(raw_data.values()),
-                color=list(raw_data.keys()),
-                color_discrete_map={'NO': '#2196F3', '>30': '#FF9800', '<30': '#F44336'},
-                title='Readmission Categories (Raw)',
-                labels={'x': 'Readmitted', 'y': 'Count'},
-            )
-            fig.update_layout(showlegend=False)
-            st.plotly_chart(fig, use_container_width=True)
-        with col2:
-            fig2 = px.pie(
-                values=[90409, 11357],
-                names=['Not Early', 'Early (<30 days)'],
-                color_discrete_sequence=['#F44336', '#2196F3'],
-                title='Early vs Non-Early Readmission',
-                hole=0.4,
-            )
-            st.plotly_chart(fig2, use_container_width=True)
+        st.markdown("### Target Variable Distribution")
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        vc = df_raw['readmitted'].value_counts()
+        axes[0].bar(vc.index, vc.values,
+                    color=['#2196F3', '#FF9800', '#F44336'])
+        axes[0].set_title('Readmission Categories')
+        axes[0].set_xlabel('Readmitted')
+        axes[0].set_ylabel('Count')
+        for i, v in enumerate(vc.values):
+            axes[0].text(i, v + 200, f'{v:,}\n({v/len(df_raw)*100:.1f}%)',
+                         ha='center', fontsize=9, fontweight='bold')
 
-        st.markdown("**Class imbalance:** Not Early: 90,409 | Early (<30 days): 11,357")
-        st.markdown("""
-        | Column | Missing Count | Missing % |
-        |--------|--------------|-----------|
-        | max_glu_serum | 96,420 | 94.75% |
-        | A1Cresult | 84,748 | 83.28% |
-        """)
+        target_binary = df_raw['readmitted'].apply(
+            lambda x: 'Early (<30 days)' if x == '<30' else 'Not Early')
+        vc2 = target_binary.value_counts()
+        axes[1].pie(vc2.values, labels=vc2.index, autopct='%1.1f%%',
+                    colors=['#F44336', '#2196F3'], startangle=90,
+                    explode=[0.05, 0], shadow=True)
+        axes[1].set_title('Early vs Non-Early Readmission')
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
 
     with tab2:
-        col1, col2 = st.columns(2)
-        with col1:
-            race_data = {
-                'Caucasian': 76099, 'AfricanAmerican': 19210,
-                'Hispanic': 2037, 'Other': 1506, 'Asian': 641,
-            }
-            fig = px.bar(
-                x=list(race_data.values()), y=list(race_data.keys()),
-                orientation='h', title='Race Distribution',
-                color=list(race_data.values()),
-                color_continuous_scale='Viridis',
-                labels={'x': 'Count', 'y': 'Race'},
-            )
-            fig.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
-        with col2:
-            fig2 = px.pie(
-                values=[53.76, 46.24],
-                names=['Female', 'Male'],
-                color_discrete_sequence=['#E91E63', '#2196F3'],
-                title='Gender Distribution',
-            )
-            st.plotly_chart(fig2, use_container_width=True)
+        st.markdown("### Demographic Overview")
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
 
-        age_data = {
-            '[0-10)': 22, '[10-20)': 167, '[20-30)': 893, '[30-40)': 2592,
-            '[40-50)': 7694, '[50-60)': 14964, '[60-70)': 23698,
-            '[70-80)': 26068, '[80-90)': 19521, '[90-100)': 6147,
-        }
-        fig3 = px.bar(
-            x=list(age_data.keys()), y=list(age_data.values()),
-            title='Age Group Distribution',
-            color=list(age_data.values()),
-            color_continuous_scale='Blues',
-            labels={'x': 'Age Group', 'y': 'Count'},
-        )
-        fig3.update_layout(coloraxis_showscale=False)
-        st.plotly_chart(fig3, use_container_width=True)
+        race_counts = df_raw['race'].replace('?', np.nan).value_counts()
+        axes[0].barh(race_counts.index, race_counts.values,
+                     color=sns.color_palette('Set2', len(race_counts)))
+        axes[0].set_title('Race Distribution')
+        axes[0].set_xlabel('Count')
+
+        gender_counts = df_raw['gender'].replace('Unknown/Invalid', np.nan).value_counts()
+        axes[1].pie(gender_counts.values, labels=gender_counts.index,
+                    autopct='%1.1f%%', colors=['#E91E63', '#2196F3'], startangle=90)
+        axes[1].set_title('Gender Distribution')
+
+        age_order = ['[0-10)', '[10-20)', '[20-30)', '[30-40)', '[40-50)',
+                     '[50-60)', '[60-70)', '[70-80)', '[80-90)', '[90-100)']
+        age_counts = df_raw['age'].value_counts().reindex(age_order)
+        axes[2].bar(age_counts.index, age_counts.values,
+                    color=sns.color_palette('Blues_d', len(age_counts)))
+        axes[2].set_title('Age Group Distribution')
+        axes[2].set_xlabel('Age Group')
+        axes[2].tick_params(axis='x', rotation=45)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
 
     with tab3:
-        med_data = {
-            'insulin': 54383, 'metformin': 19988, 'glipizide': 12686,
-            'glyburide': 10650, 'pioglitazone': 7328, 'rosiglitazone': 6365,
-            'glimepiride': 5191, 'repaglinide': 1539, 'nateglinide': 703,
-            'acarbose': 308, 'chlorpropamide': 86, 'miglitol': 38,
-        }
-        labels = [f"{k}\n({v/101766*100:.1f}%)" for k, v in med_data.items()]
-        fig = px.bar(
-            x=list(med_data.values()), y=labels,
-            orientation='h', title='Medication Usage (Patients on Any Dose)',
-            color=list(med_data.values()),
-            color_continuous_scale='Greens',
-            labels={'x': 'Number of Patients', 'y': 'Medication'},
+        st.markdown("### Medication Usage")
+        med_cols_raw = ['metformin', 'glipizide', 'glyburide', 'pioglitazone',
+                        'glimepiride', 'insulin', 'rosiglitazone', 'repaglinide',
+                        'nateglinide', 'acarbose', 'miglitol', 'chlorpropamide']
+        med_summary = {col: (df_raw[col] != 'No').sum()
+                       for col in med_cols_raw if col in df_raw.columns}
+        med_df = pd.Series(med_summary).sort_values(ascending=True)
+
+        fig, ax = plt.subplots(figsize=(10, 6))
+        import matplotlib.cm as cm
+        colors = cm.RdYlGn(np.linspace(0.2, 0.9, len(med_df)))
+        bars = ax.barh(med_df.index, med_df.values, color=colors, edgecolor='black')
+        for bar, val in zip(bars, med_df.values):
+            ax.text(val + 150, bar.get_y() + bar.get_height() / 2.,
+                    f'{val:,} ({val/len(df_raw)*100:.1f}%)', va='center', fontsize=9)
+        ax.set_title('Medication Usage (Patients on Any Dose)')
+        ax.set_xlabel('Number of Patients')
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+    with tab4:
+        st.markdown("### Numerical Feature Distributions")
+        num_cols = ['time_in_hospital', 'num_lab_procedures', 'num_medications',
+                    'num_procedures', 'number_diagnoses', 'number_inpatient']
+        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+        axes = axes.flatten()
+        for i, col in enumerate(num_cols):
+            if col in df_raw.columns:
+                axes[i].hist(df_raw[col], bins=30, color='#3F51B5',
+                             edgecolor='white', alpha=0.85)
+                axes[i].axvline(df_raw[col].mean(), color='red',
+                                linestyle='--', linewidth=2)
+                axes[i].set_title(col.replace('_', ' ').title())
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+    with tab5:
+        st.markdown("### Missing Values")
+        missing = df_raw.isnull().sum()
+        missing_pct = (missing / len(df_raw) * 100).round(2)
+        missing_df = pd.DataFrame({'Count': missing, 'Percentage (%)': missing_pct})
+        missing_df = missing_df[missing_df['Count'] > 0].sort_values('Count', ascending=False)
+        if missing_df.empty:
+            st.success("✅ No missing values found!")
+        else:
+            st.dataframe(missing_df, use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3: TRAIN & EVALUATE
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🤖 Train & Evaluate":
+    st.markdown('<div class="section-title">🤖 Model Training & Evaluation</div>',
+                unsafe_allow_html=True)
+
+    st.info("⚙️ Data will be preprocessed automatically before training.")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        test_size = st.slider("Test Set Size", 0.1, 0.4, 0.2, 0.05)
+    with col2:
+        use_smote = st.checkbox("Apply SMOTE (Balance Classes)", value=False,
+                                help="SMOTE oversamples the minority class")
+
+    if st.button("🚀 Train Models", type="primary", use_container_width=True):
+        with st.spinner("⏳ Preprocessing data..."):
+            df_clean = load_and_preprocess(df_raw)
+
+        st.success(f"✅ Preprocessed: {df_clean.shape[0]:,} rows × {df_clean.shape[1]} columns")
+
+        X = df_clean.drop('readmitted', axis=1)
+        y = df_clean['readmitted']
+
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=test_size, random_state=42, stratify=y
         )
-        fig.update_layout(coloraxis_showscale=False, height=500)
-        st.plotly_chart(fig, use_container_width=True)
+
+        scaler = StandardScaler()
+        X_train_sc = scaler.fit_transform(X_train)
+        X_test_sc = scaler.transform(X_test)
+
+        if use_smote:
+            try:
+                from imblearn.over_sampling import SMOTE
+                smote = SMOTE(random_state=42)
+                X_train_sc, y_train = smote.fit_resample(X_train_sc, y_train)
+                st.info(f"🔄 SMOTE applied: {pd.Series(y_train).value_counts().to_dict()}")
+            except ImportError:
+                st.warning("⚠️ imbalanced-learn not installed. Skipping SMOTE.")
+
+        with st.spinner("🏋️ Training models..."):
+            results = train_models(X_train_sc, y_train, X_test_sc, y_test)
+
+        st.session_state['results'] = results
+        st.session_state['X_test'] = X_test_sc
+        st.session_state['y_test'] = y_test.values
+        st.session_state['scaler'] = scaler
+        st.session_state['feature_cols'] = list(X.columns)
+
+        # Metrics Table
+        st.markdown('<div class="section-title">📊 Model Comparison</div>',
+                    unsafe_allow_html=True)
+        metrics_df = pd.DataFrame({
+            'Model': list(results.keys()),
+            'Accuracy': [results[m]['acc'] for m in results],
+            'F1 Score': [results[m]['f1'] for m in results],
+            'ROC AUC': [results[m]['roc'] for m in results],
+            'Recall (class 1)': [results[m]['report']['1']['recall'] for m in results],
+            'Precision (class 1)': [results[m]['report']['1']['precision'] for m in results],
+        }).set_index('Model').round(4)
+        st.dataframe(metrics_df.style.highlight_max(axis=0, color='#C8E6C9'),
+                     use_container_width=True)
+
+        # ROC Curves
+        st.markdown('<div class="section-title">📈 ROC Curves</div>', unsafe_allow_html=True)
+        fig, ax = plt.subplots(figsize=(9, 6))
+        colors_roc = ['#2196F3', '#4CAF50', '#FF9800']
+        for (name, res), color in zip(results.items(), colors_roc):
+            fpr, tpr, _ = roc_curve(y_test, res['y_prob'])
+            ax.plot(fpr, tpr, color=color, linewidth=2.5,
+                    label=f"{name} (AUC = {res['roc']:.3f})")
+        ax.plot([0, 1], [0, 1], 'k--', linewidth=1.5, label='Random (AUC = 0.500)')
+        ax.set_title('ROC Curves – All Models', fontsize=14, fontweight='bold')
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3)
+        st.pyplot(fig)
+        plt.close()
+
+        # Confusion Matrices
+        st.markdown('<div class="section-title">🔲 Confusion Matrices</div>',
+                    unsafe_allow_html=True)
+        fig, axes = plt.subplots(1, len(results), figsize=(16, 5))
+        if len(results) == 1:
+            axes = [axes]
+        for ax, (name, res) in zip(axes, results.items()):
+            cm = confusion_matrix(y_test, res['y_pred'])
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
+                        xticklabels=['No Readmit', 'Early Readmit'],
+                        yticklabels=['No Readmit', 'Early Readmit'],
+                        annot_kws={'size': 13, 'weight': 'bold'})
+            ax.set_title(name, fontsize=11, fontweight='bold')
+            ax.set_xlabel('Predicted')
+            ax.set_ylabel('Actual')
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+        # Feature Importance
+        st.markdown('<div class="section-title">⭐ Feature Importance (XGBoost)</div>',
+                    unsafe_allow_html=True)
+        best_xgb = results['XGBoost']['model']
+        feat_imp = pd.Series(best_xgb.feature_importances_, index=X.columns)
+        top20 = feat_imp.sort_values(ascending=True).tail(20)
+        fig, ax = plt.subplots(figsize=(10, 7))
+        import matplotlib.cm as cm
+        colors_fi = cm.RdYlGn(np.linspace(0.2, 0.9, len(top20)))
+        ax.barh(top20.index, top20.values, color=colors_fi, edgecolor='black')
+        ax.set_title('Top 20 Feature Importances – XGBoost')
+        ax.set_xlabel('Importance Score')
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
+
+    elif 'results' in st.session_state:
+        st.info("✅ Models already trained! Results are stored in session. "
+                "Retrain anytime by clicking the button above.")
 
 
-# ═══════════════════════════════════════════════════════════════
-#  PAGE: Predict
-# ═══════════════════════════════════════════════════════════════
-
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 4: PREDICT
+# ══════════════════════════════════════════════════════════════════════════════
 elif page == "🔮 Predict":
-    st.title("🔮 Patient Readmission Risk Predictor")
+    st.markdown('<div class="section-title">🔮 Patient Readmission Prediction</div>',
+                unsafe_allow_html=True)
 
-    tabs = st.tabs(["🧑‍⚕️ Single Patient", "📂 Batch CSV Upload"])
+    if 'results' not in st.session_state:
+        st.warning("⚠️ Please train models first (go to **Train & Evaluate** page).")
+        st.stop()
 
-    # ── Single patient ────────────────────────────────────────────────────────
-    with tabs[0]:
-        st.markdown("Fill in the patient details below:")
+    st.markdown("Fill in patient details to predict early readmission risk.")
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            age_val = st.selectbox("Age Group", [
-                '[0-10)', '[10-20)', '[20-30)', '[30-40)', '[40-50)',
-                '[50-60)', '[60-70)', '[70-80)', '[80-90)', '[90-100)',
-            ], index=6)
-            gender_val = st.selectbox("Gender", ['Male', 'Female'])
-            race_val = st.selectbox("Race", [
-                'Caucasian', 'AfricanAmerican', 'Hispanic', 'Asian', 'Other',
-            ])
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        age = st.selectbox("Age Group", ['[0-10)', '[10-20)', '[20-30)', '[30-40)', '[40-50)',
+                                          '[50-60)', '[60-70)', '[70-80)', '[80-90)', '[90-100)'],
+                            index=6)
+        gender = st.selectbox("Gender", ['Male', 'Female'])
+        race = st.selectbox("Race", ['Caucasian', 'AfricanAmerican', 'Other', 'Asian', 'Hispanic'])
+        time_in_hospital = st.slider("Days in Hospital", 1, 14, 4)
 
-        with col2:
-            time_in_hosp = st.slider("Time in Hospital (days)", 1, 14, 4)
-            num_lab = st.slider("# Lab Procedures", 1, 120, 44)
-            num_meds = st.slider("# Medications", 1, 80, 15)
-            num_diag = st.slider("# Diagnoses", 1, 16, 7)
+    with col2:
+        num_lab_procedures = st.slider("# Lab Procedures", 1, 120, 43)
+        num_procedures = st.slider("# Procedures", 0, 6, 1)
+        num_medications = st.slider("# Medications", 1, 81, 16)
+        number_diagnoses = st.slider("# Diagnoses", 1, 16, 7)
 
-        with col3:
-            num_inpat = st.slider("# Inpatient Visits (prior year)", 0, 20, 0)
-            num_emerg = st.slider("# Emergency Visits (prior year)", 0, 20, 0)
-            num_outpat = st.slider("# Outpatient Visits (prior year)", 0, 40, 0)
-            insulin_val = st.selectbox("Insulin", ['No', 'Steady', 'Up', 'Down'])
-            metformin_val = st.selectbox("Metformin", ['No', 'Steady', 'Up', 'Down'])
+    with col3:
+        number_inpatient = st.slider("# Inpatient Visits", 0, 20, 0)
+        number_emergency = st.slider("# Emergency Visits", 0, 20, 0)
+        number_outpatient = st.slider("# Outpatient Visits", 0, 40, 0)
+        insulin = st.selectbox("Insulin", ['No', 'Steady', 'Up', 'Down'])
 
-        model_choice = st.selectbox("Select Model", list(MODEL_FILES.keys()))
+    model_choice = st.selectbox("🤖 Choose Model",
+                                 list(st.session_state['results'].keys()))
 
-        if st.button("🔮 Predict Risk", type="primary"):
-            model = load_model(MODEL_FILES[model_choice])
-            scaler = load_scaler()
-            feature_cols = load_feature_cols()
+    if st.button("🔮 Predict Readmission Risk", type="primary", use_container_width=True):
+        age_order = ['[0-10)', '[10-20)', '[20-30)', '[30-40)', '[40-50)',
+                     '[50-60)', '[60-70)', '[70-80)', '[80-90)', '[90-100)']
+        age_enc = age_order.index(age)
+        gender_enc = 1 if gender == 'Male' else 2
+        race_enc = {'Caucasian': 1, 'AfricanAmerican': 2, 'Other': 3,
+                    'Asian': 4, 'Hispanic': 5}[race]
+        med_map = {'Down': -1, 'No': 0, 'Steady': 1, 'Up': 2}
+        insulin_enc = med_map[insulin]
 
-            if model is None or scaler is None:
-                st.warning(
-                    "⚠️ No trained models found. "
-                    "Run `python src/train.py --data data/diabetic_data.csv` first, "
-                    "or the app will show a demo prediction."
-                )
-                # Demo result
-                prob = np.random.uniform(0.1, 0.6)
-                pred = 1 if prob > 0.35 else 0
-            else:
-                AGE_MAP = {v: i for i, v in enumerate([
-                    '[0-10)', '[10-20)', '[20-30)', '[30-40)', '[40-50)',
-                    '[50-60)', '[60-70)', '[70-80)', '[80-90)', '[90-100)',
-                ])}
-                MED_MAP = {'Down': -1, 'No': 0, 'Steady': 1, 'Up': 2}
-                RACE_MAP = {'Caucasian': 1, 'AfricanAmerican': 2, 'Other': 3, 'Asian': 4, 'Hispanic': 5}
-                GENDER_MAP = {'Male': 1, 'Female': 2}
+        # Build a row matching training features
+        feature_cols = st.session_state['feature_cols']
+        row = pd.Series(0.0, index=feature_cols)
 
-                patient = {
-                    'age': AGE_MAP.get(age_val, 6),
-                    'gender': GENDER_MAP.get(gender_val, 1),
-                    'race': RACE_MAP.get(race_val, 1),
-                    'time_in_hospital': time_in_hosp,
-                    'num_lab_procedures': num_lab,
-                    'num_medications': num_meds,
-                    'number_diagnoses': num_diag,
-                    'number_inpatient': num_inpat,
-                    'number_emergency': num_emerg,
-                    'number_outpatient': num_outpat,
-                    'insulin': MED_MAP.get(insulin_val, 0),
-                    'metformin': MED_MAP.get(metformin_val, 0),
-                }
-                df_pat = pd.DataFrame([patient])
-                for col in feature_cols:
-                    if col not in df_pat.columns:
-                        df_pat[col] = 0
-                df_pat = df_pat[feature_cols]
-                X = scaler.transform(df_pat)
-                pred = model.predict(X)[0]
-                prob = model.predict_proba(X)[0][1]
+        # Fill known fields
+        mapping = {
+            'age': age_enc, 'gender': gender_enc, 'race': race_enc,
+            'time_in_hospital': time_in_hospital,
+            'num_lab_procedures': num_lab_procedures,
+            'num_procedures': num_procedures,
+            'num_medications': num_medications,
+            'number_diagnoses': number_diagnoses,
+            'number_inpatient': number_inpatient,
+            'number_emergency': number_emergency,
+            'number_outpatient': number_outpatient,
+            'insulin': insulin_enc,
+        }
+        for k, v in mapping.items():
+            if k in row.index:
+                row[k] = v
 
-            st.markdown("---")
-            risk_class = "risk-high" if pred == 1 else "risk-low"
-            risk_label = "⚠️ High Risk — Early Readmission Likely" if pred == 1 else "✅ Low Risk — No Early Readmission Expected"
+        X_input = row.values.reshape(1, -1)
+        scaler = st.session_state['scaler']
+        model = st.session_state['results'][model_choice]['model']
 
-            col_r1, col_r2 = st.columns(2)
-            with col_r1:
-                st.markdown(
-                    f'<div class="metric-card {risk_class}">'
-                    f'<p class="metric-label">Prediction</p>'
-                    f'<p class="metric-value">{risk_label}</p></div>',
-                    unsafe_allow_html=True,
-                )
-            with col_r2:
-                st.markdown(
-                    f'<div class="metric-card {risk_class}">'
-                    f'<p class="metric-label">Readmission Probability</p>'
-                    f'<p class="metric-value">{prob:.1%}</p></div>',
-                    unsafe_allow_html=True,
-                )
+        X_scaled = scaler.transform(X_input)
+        prob = model.predict_proba(X_scaled)[0][1]
+        pred = model.predict(X_scaled)[0]
 
-            # Gauge
-            fig_gauge = go.Figure(go.Indicator(
-                mode='gauge+number',
-                value=round(prob * 100, 1),
-                title={'text': 'Readmission Risk (%)'},
-                gauge={
-                    'axis': {'range': [0, 100]},
-                    'bar': {'color': '#F44336' if pred == 1 else '#4CAF50'},
-                    'steps': [
-                        {'range': [0, 35], 'color': '#e8f5e9'},
-                        {'range': [35, 65], 'color': '#fff8e1'},
-                        {'range': [65, 100], 'color': '#ffebee'},
-                    ],
-                    'threshold': {'line': {'color': '#333', 'width': 3}, 'value': 35},
-                },
-                number={'suffix': '%'},
-            ))
-            fig_gauge.update_layout(height=300)
-            st.plotly_chart(fig_gauge, use_container_width=True)
+        st.markdown("---")
+        risk_color = "#F44336" if prob > 0.5 else "#4CAF50"
+        risk_label = "⚠️ HIGH RISK" if prob > 0.5 else "✅ LOW RISK"
 
-    # ── Batch upload ──────────────────────────────────────────────────────────
-    with tabs[1]:
-        st.markdown("Upload a CSV file matching the original dataset format.")
-        uploaded = st.file_uploader("Choose CSV file", type=['csv'])
+        st.markdown(f"""
+        <div style="background: {risk_color}22; border: 2px solid {risk_color};
+                    border-radius: 12px; padding: 1.5rem; text-align: center;">
+            <h2 style="color: {risk_color}; margin: 0;">{risk_label}</h2>
+            <h3 style="color: #333; margin: 0.5rem 0;">
+                Readmission Probability: <b>{prob*100:.1f}%</b>
+            </h3>
+            <p style="color: #555; margin: 0;">Model: {model_choice}</p>
+        </div>
+        """, unsafe_allow_html=True)
 
-        if uploaded:
-            df_up = pd.read_csv(uploaded)
-            st.write(f"Loaded: **{df_up.shape[0]} rows × {df_up.shape[1]} columns**")
-            st.dataframe(df_up.head())
-
-            model_choice_b = st.selectbox("Model for Batch", list(MODEL_FILES.keys()), key='batch_model')
-
-            if st.button("Run Batch Prediction", type="primary"):
-                model_b = load_model(MODEL_FILES[model_choice_b])
-                scaler_b = load_scaler()
-                feature_cols_b = load_feature_cols()
-
-                if model_b is None or scaler_b is None:
-                    st.warning("Train models first (`python src/train.py`).")
-                else:
-                    has_target = 'readmitted' in df_up.columns
-                    X_b, y_b, _, _ = preprocess(df_up, scaler=scaler_b, fit_scaler=False)
-                    preds = model_b.predict(X_b)
-                    probs = model_b.predict_proba(X_b)[:, 1]
-
-                    df_up['Prediction'] = preds
-                    df_up['Risk Probability'] = probs.round(4)
-                    st.success(f"✅ Predicted {len(preds)} patients")
-                    st.dataframe(df_up[['Prediction', 'Risk Probability']].head(20))
-
-                    csv_out = df_up.to_csv(index=False).encode()
-                    st.download_button(
-                        "⬇️ Download Predictions CSV",
-                        csv_out, "predictions.csv", "text/csv",
-                    )
-
-
-# ═══════════════════════════════════════════════════════════════
-#  PAGE: Model Comparison
-# ═══════════════════════════════════════════════════════════════
-
-elif page == "📈 Model Comparison":
-    st.title("📈 Model Comparison & Analysis")
-
-    st.markdown("### Metrics Summary")
-    st.dataframe(HARDCODED_METRICS.style.highlight_max(axis=0, color='#c8e6c9').format("{:.4f}"))
-
-    st.markdown("---")
-
-    # Bar chart
-    metrics_to_plot = ['Accuracy', 'F1 Score', 'ROC AUC', 'Recall (class 1)']
-    colors = ['#2196F3', '#4CAF50', '#FF9800', '#F44336']
-
-    fig = go.Figure()
-    for metric, color in zip(metrics_to_plot, colors):
-        fig.add_trace(go.Bar(
-            name=metric,
-            x=HARDCODED_METRICS.index,
-            y=HARDCODED_METRICS[metric],
-            marker_color=color,
-        ))
-    fig.update_layout(
-        barmode='group', title='Model Performance Comparison',
-        yaxis=dict(range=[0, 1.05]),
-        xaxis_tickangle=-30, height=450,
-        legend=dict(orientation='h', y=1.05),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("### Feature Importance (XGBoost + SMOTE — Top 20)")
-    feat_importance = {
-        'number_inpatient': 0.2332, 'age': 0.0962, 'discharge_disposition_id': 0.0892,
-        'time_in_hospital': 0.0748, 'race': 0.0736, 'num_procedures': 0.0633,
-        'gender': 0.0615, 'number_diagnoses': 0.0420, 'admission_type_id': 0.0366,
-        'admission_source_id': 0.0242, 'insulin': 0.0173, 'metformin': 0.0172,
-        'diag_1_Circulatory': 0.0153, 'num_medications_taken': 0.0134,
-        'diag_3_Other': 0.0129, 'diag_2_Other': 0.0119, 'diabetesMed': 0.0064,
-        'change': 0.0063, 'diag_1_Other': 0.0057, 'diag_3_Circulatory': 0.0056,
-    }
-    feat_df = pd.DataFrame.from_dict(feat_importance, orient='index', columns=['Importance'])
-    feat_df = feat_df.sort_values('Importance')
-    fig2 = px.bar(
-        feat_df, x='Importance', y=feat_df.index, orientation='h',
-        color='Importance', color_continuous_scale='Teal',
-        title='Top 20 Feature Importances — XGBoost + SMOTE',
-    )
-    fig2.update_layout(height=580, coloraxis_showscale=False)
-    st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("### Key Takeaways")
-    st.markdown("""
-    - 🏆 **Best Recall (class 1):** Random Forest Balanced (0.539) and XGBoost (0.526) — best for catching high-risk patients
-    - 🎯 **Best ROC AUC:** XGBoost + SMOTE (0.676)
-    - ⚖️ **Best F1 Score:** XGBoost (0.277)
-    - ⚠️ SMOTE and ensemble methods boost accuracy but can collapse minority-class recall — always inspect **class-specific metrics**
-    - 🔑 Top predictor: **number_inpatient** (prior inpatient visits) — the strongest signal for future readmission
-    """)
+        st.markdown("#### Risk Gauge")
+        fig, ax = plt.subplots(figsize=(6, 1.5))
+        ax.barh(['Risk'], [prob], color=risk_color, height=0.4)
+        ax.barh(['Risk'], [1 - prob], left=[prob], color='#E0E0E0', height=0.4)
+        ax.axvline(0.5, color='gray', linestyle='--', linewidth=1)
+        ax.set_xlim(0, 1)
+        ax.text(prob / 2, 0, f'{prob*100:.1f}%', ha='center', va='center',
+                color='white', fontweight='bold', fontsize=13)
+        ax.axis('off')
+        ax.set_title(f'Readmission Risk Score ({model_choice})', fontsize=11)
+        plt.tight_layout()
+        st.pyplot(fig)
+        plt.close()
